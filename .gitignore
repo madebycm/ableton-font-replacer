@@ -1,0 +1,8 @@
+# Virtual environment
+.font-venv/
+
+# macOS
+.DS_Store
+
+# Temp files
+*.tmp
