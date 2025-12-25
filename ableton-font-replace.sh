@@ -410,10 +410,13 @@ handle_codesign() {
         case $choice in
             1)
                 log_info "Removing code signature..."
+                sudo xattr -cr "$ABLETON_APP"
                 sudo codesign --remove-signature "$ABLETON_APP"
                 ;;
             2)
                 log_info "Re-signing with ad-hoc signature..."
+                log_info "Stripping extended attributes..."
+                sudo xattr -cr "$ABLETON_APP"
                 sudo codesign --force --deep --sign - "$ABLETON_APP"
                 ;;
             3)
