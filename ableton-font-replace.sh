@@ -21,28 +21,116 @@ BACKUP_DIR="$HOME/.ableton-font-backup"
 VENV_DIR="$SCRIPT_DIR/.font-venv"
 TEMP_DIR=$(mktemp -d)
 
-# Find Ableton installation
-find_ableton() {
-    local ableton_path=""
+# Find every Ableton installation on this machine (one path per line).
+# Stable (non-beta) builds are listed first so index 1 is always the safe default.
+find_ableton_all() {
+    local found=()
+    local app
 
-    # Check common locations
+    # Common location
     for app in "/Applications/Ableton Live"*".app"; do
-        if [[ -d "$app" ]]; then
-            ableton_path="$app"
-            break
-        fi
+        [[ -d "$app" ]] && found+=("$app")
     done
 
-    if [[ -z "$ableton_path" ]]; then
-        # Try Spotlight
-        ableton_path=$(mdfind "kMDItemKind == 'Application' && kMDItemFSName == 'Ableton Live*'" 2>/dev/null | head -1)
-    fi
+    # Spotlight (catches installs outside /Applications)
+    while IFS= read -r app; do
+        [[ -n "$app" && -d "$app" ]] && found+=("$app")
+    done < <(mdfind "kMDItemKind == 'Application' && kMDItemFSName == 'Ableton Live*'" 2>/dev/null)
 
-    echo "$ableton_path"
+    [[ ${#found[@]} -eq 0 ]] && return 0
+
+    # Dedupe, then sort: stable builds first, betas last
+    local stable=() beta=()
+    while IFS= read -r app; do
+        if is_beta "$app"; then
+            beta+=("$app")
+        else
+            stable+=("$app")
+        fi
+    done < <(printf '%s\n' "${found[@]}" | sort -u)
+
+    printf '%s\n' "${stable[@]}" "${beta[@]}" | grep -v '^$' || true
 }
 
-ABLETON_APP=$(find_ableton)
-FONTS_DIR="$ABLETON_APP/Contents/App-Resources/Fonts"
+is_beta() {
+    # Matches "Beta", "Alpha", "Trial" anywhere in the bundle name
+    local name
+    name=$(basename "$1")
+    shopt -s nocasematch
+    local result=1
+    [[ "$name" == *beta* || "$name" == *alpha* || "$name" == *trial* ]] && result=0
+    shopt -u nocasematch
+    return $result
+}
+
+# Resolve which installation to operate on. Sets ABLETON_APP + FONTS_DIR.
+# With multiple installs the user picks; the default (option 1) is the
+# non-beta build. Non-interactive runs take that default silently.
+select_ableton() {
+    # Explicit --app wins, no prompting
+    if [[ -n "$ABLETON_APP" ]]; then
+        FONTS_DIR="$ABLETON_APP/Contents/App-Resources/Fonts"
+        return 0
+    fi
+
+    local apps=()
+    while IFS= read -r app; do
+        [[ -n "$app" ]] && apps+=("$app")
+    done < <(find_ableton_all)
+
+    if [[ ${#apps[@]} -eq 0 ]]; then
+        ABLETON_APP=""
+        FONTS_DIR=""
+        return 0
+    fi
+
+    if [[ ${#apps[@]} -eq 1 ]]; then
+        ABLETON_APP="${apps[0]}"
+        FONTS_DIR="$ABLETON_APP/Contents/App-Resources/Fonts"
+        return 0
+    fi
+
+    # Multiple installs found
+    if [[ ! -t 0 ]]; then
+        ABLETON_APP="${apps[0]}"
+        FONTS_DIR="$ABLETON_APP/Contents/App-Resources/Fonts"
+        log_warn "Multiple Ableton installations found; using default: $(basename "$ABLETON_APP")"
+        log_warn "Use --app \"/Applications/....app\" to target a different one."
+        return 0
+    fi
+
+    echo "" >&2
+    log_warn "Found ${#apps[@]} Ableton installations:"
+    echo "" >&2
+    local i=1
+    for app in "${apps[@]}"; do
+        local label=""
+        is_beta "$app" && label=" ${YELLOW}(beta)${NC}"
+        if [[ $i -eq 1 ]]; then
+            echo -e "  $i) $(basename "$app")$label  ${GREEN}[default]${NC}" >&2
+        else
+            echo -e "  $i) $(basename "$app")$label" >&2
+        fi
+        i=$((i + 1))
+    done
+    echo "" >&2
+
+    local choice
+    read -r -p "Which installation? [1]: " choice
+    choice=${choice:-1}
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#apps[@]} )); then
+        log_error "Invalid selection: $choice"
+        exit 1
+    fi
+
+    ABLETON_APP="${apps[$((choice - 1))]}"
+    FONTS_DIR="$ABLETON_APP/Contents/App-Resources/Fonts"
+}
+
+# Resolved later (in check_requirements) so --help/--list/--revert never prompt.
+ABLETON_APP=""
+FONTS_DIR=""
 
 # Font files to replace (main UI fonts)
 FONT_FILES=(
@@ -84,6 +172,8 @@ log_error() {
 
 check_requirements() {
     log_info "Checking requirements..."
+
+    select_ableton
 
     if [[ -z "$ABLETON_APP" || ! -d "$ABLETON_APP" ]]; then
         log_error "Ableton Live not found!"
@@ -371,23 +461,93 @@ prepare_replacement_fonts() {
     echo "$output_dir"
 }
 
+# Identify the GUI application macOS holds responsible for TCC checks
+# (App Management / Full Disk Access). This is the terminal emulator that
+# ultimately spawned this script, not bash/zsh.
+controlling_app() {
+    local pid=$PPID
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        local info ppid comm
+        info=$(ps -o ppid=,comm= -p "$pid" 2>/dev/null) || break
+        [[ -z "$info" ]] && break
+        ppid=$(awk '{print $1}' <<<"$info")
+        comm=${info#*[0-9] }
+        case "$comm" in
+            *iTerm2*)                              echo "iTerm";              return;;
+            *Apple_Terminal*|*Terminal)            echo "Terminal";           return;;
+            *"Visual Studio Code"*|*Code\ Helper*|*Electron*) echo "Visual Studio Code"; return;;
+            *Warp*)                                echo "Warp";               return;;
+            *WezTerm*|*wezterm*)                   echo "WezTerm";            return;;
+            *Hyper*)                               echo "Hyper";              return;;
+            *kitty*)                               echo "kitty";              return;;
+            *alacritty*|*Alacritty*)               echo "Alacritty";          return;;
+            *Ghostty*|*ghostty*)                   echo "Ghostty";            return;;
+        esac
+        [[ -z "$ppid" || "$ppid" == "0" || "$ppid" == "1" ]] && break
+        pid=$ppid
+    done
+    echo "your terminal app"
+}
+
+# Real write test (the [[ -w ]] bit-check lies under macOS TCC: you can own
+# the directory with the write bit set and still be denied at the kernel level).
+bundle_writable() {
+    local probe="$FONTS_DIR/.write_probe_$$"
+    if ( : > "$probe" ) 2>/dev/null; then
+        rm -f "$probe" 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
+print_app_management_help() {
+    local app
+    app=$(controlling_app)
+    echo "" >&2
+    log_error "macOS blocked writing into the Ableton app bundle (\"Operation not permitted\")."
+    echo "" >&2
+    echo "This is NOT a sudo problem. macOS App Management / System Integrity" >&2
+    echo "protection (Ventura and later) prevents modifying another app's bundle —" >&2
+    echo "even as root — unless the terminal you run from is granted permission." >&2
+    echo "" >&2
+    echo "Fix:" >&2
+    echo "  1. Open  System Settings -> Privacy & Security -> App Management" >&2
+    echo "        (if that toggle doesn't stick, use 'Full Disk Access' instead)" >&2
+    echo "  2. Enable the switch for:  ${app}" >&2
+    echo "  3. FULLY QUIT ${app} (Cmd+Q) and reopen it  (required for it to take effect)" >&2
+    echo "  4. Re-run this script:  $0" >&2
+    echo "" >&2
+    echo "Your original fonts are safely backed up at: $BACKUP_DIR/latest" >&2
+    echo "" >&2
+}
+
 install_fonts() {
     local prepared_dir="$1"
 
     log_info "Installing replacement fonts..."
 
-    # Check if we need sudo
-    if [[ ! -w "$FONTS_DIR" ]]; then
+    local use_sudo=""
+    if ! bundle_writable; then
         log_warn "Need administrator privileges to modify Ableton fonts"
-
-        for font in "${FONT_FILES[@]}"; do
-            sudo cp "$prepared_dir/$font" "$FONTS_DIR/$font"
-        done
-    else
-        for font in "${FONT_FILES[@]}"; do
-            cp "$prepared_dir/$font" "$FONTS_DIR/$font"
-        done
+        use_sudo="sudo"
+        # Prime credentials up front so any prompt isn't buried mid-loop.
+        if ! sudo -v; then
+            print_app_management_help
+            exit 1
+        fi
     fi
+
+    for font in "${FONT_FILES[@]}"; do
+        if $use_sudo cp "$prepared_dir/$font" "$FONTS_DIR/$font" 2>/dev/null; then
+            log_info "Installed: $font"
+        elif [[ -z "$use_sudo" ]] && sudo cp "$prepared_dir/$font" "$FONTS_DIR/$font" 2>/dev/null; then
+            log_info "Installed: $font (via sudo)"
+        else
+            # Under App Management, even 'sudo cp' returns EPERM — surface the real fix.
+            print_app_management_help
+            exit 1
+        fi
+    done
 
     log_info "Fonts installed successfully"
 }
@@ -457,18 +617,31 @@ revert_fonts() {
         exit 1
     fi
 
+    # Point the writability/help helpers at the restore target
+    FONTS_DIR="$target_fonts"
+    local use_sudo=""
+    if ! bundle_writable; then
+        use_sudo="sudo"
+        if ! sudo -v; then
+            print_app_management_help
+            exit 1
+        fi
+    fi
+
     # Restore fonts
     for font in "${FONT_FILES[@]}"; do
         local src="$backup_path/$font"
         local dest="$target_fonts/$font"
 
         if [[ -f "$src" ]]; then
-            if [[ ! -w "$target_fonts" ]]; then
-                sudo cp "$src" "$dest"
+            if $use_sudo cp "$src" "$dest" 2>/dev/null; then
+                log_info "Restored: $font"
+            elif [[ -z "$use_sudo" ]] && sudo cp "$src" "$dest" 2>/dev/null; then
+                log_info "Restored: $font (via sudo)"
             else
-                cp "$src" "$dest"
+                print_app_management_help
+                exit 1
             fi
-            log_info "Restored: $font"
         else
             log_warn "Backup file not found: $font"
         fi
@@ -577,7 +750,6 @@ use_custom_font() {
 }
 
 show_help() {
-    print_header
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
@@ -585,12 +757,20 @@ show_help() {
     echo "  --revert, -r        Revert to original Ableton fonts"
     echo "  --list, -l          List available backups"
     echo "  --custom <font>     Use a custom TTF font file"
+    echo "  --scale <factor>    Scale the replacement font (e.g. 1.15)"
+    echo "  --app <path>        Target a specific Ableton Live .app bundle"
     echo "  --help, -h          Show this help message"
+    echo ""
+    echo "Multiple installations:"
+    echo "  If several Ableton Live builds are installed (e.g. stable + beta),"
+    echo "  you'll be asked which one to patch. The non-beta build is the default."
+    echo "  Use --app to skip the prompt (required for non-interactive runs)."
     echo ""
     echo "Examples:"
     echo "  $0                          # Install Atkinson Hyperlegible"
     echo "  $0 --revert                 # Restore original fonts"
     echo "  $0 --custom ~/my-font.ttf   # Use custom font"
+    echo "  $0 --app \"/Applications/Ableton Live 12 Beta.app\""
     echo ""
     echo "Recommended fonts for astigmatism:"
     echo "  - Atkinson Hyperlegible (default, by Braille Institute)"
@@ -630,6 +810,18 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             FONT_SCALE="$2"
+            shift 2
+            ;;
+        --app|-a)
+            if [[ -z "${2:-}" ]]; then
+                log_error "Please provide the path to an Ableton Live .app bundle"
+                exit 1
+            fi
+            ABLETON_APP="${2%/}"
+            if [[ ! -d "$ABLETON_APP" ]]; then
+                log_error "Not a directory: $ABLETON_APP"
+                exit 1
+            fi
             shift 2
             ;;
         --custom|-c)

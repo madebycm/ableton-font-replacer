@@ -21,6 +21,7 @@ This tool replaces Ableton's fonts with **Atkinson Hyperlegible**, a font design
 - Automatic backup of original fonts
 - Easy revert to original fonts
 - Support for custom fonts
+- Detects multiple installations (stable + beta) and lets you choose
 - Handles macOS code signing automatically
 
 ## Quick Start
@@ -53,9 +54,30 @@ That's it! Restart Ableton Live to see the new fonts.
 # List available backups
 ./ableton-font-replace.sh --list
 
+# Target a specific installation (skips the picker)
+./ableton-font-replace.sh --app "/Applications/Ableton Live 12 Beta.app"
+
 # Show help
 ./ableton-font-replace.sh --help
 ```
+
+### Multiple Ableton installations
+
+If you have more than one Ableton Live build installed — for example a stable
+release alongside a beta — the script lists them and asks which one to patch:
+
+```
+[WARN] Found 2 Ableton installations:
+
+  1) Ableton Live 12 Suite.app  [default]
+  2) Ableton Live 12 Beta.app (beta)
+
+Which installation? [1]:
+```
+
+The **non-beta build is always the default** (just press Enter). Beta, alpha and
+trial builds are sorted last and labelled. When stdin isn't a terminal (CI, pipes),
+the default is chosen automatically — use `--app` to pick a different one.
 
 ## About Atkinson Hyperlegible
 
@@ -68,7 +90,7 @@ That's it! Restart Ableton Live to see the new fonts.
 
 ## How It Works
 
-1. **Locates** your Ableton Live installation
+1. **Locates** your Ableton Live installation(s) — asks which to patch if there's more than one
 2. **Downloads** Atkinson Hyperlegible font files
 3. **Backs up** original fonts to `~/.ableton-font-backup/`
 4. **Rewrites** font metadata to match Ableton's expected font names
@@ -81,8 +103,26 @@ That's it! Restart Ableton Live to see the new fonts.
 - Ableton Live 11 or 12
 - Python 3 (comes with macOS)
 - Administrator privileges (for code signing)
+- On macOS Ventura (13) and later: your terminal app needs **App Management**
+  (or **Full Disk Access**) permission — see Troubleshooting below
 
 ## Troubleshooting
+
+### "Operation not permitted" when installing fonts
+
+On macOS Ventura (13) and later, **App Management / System Integrity protection**
+blocks modifying another app's bundle — *even with `sudo`* — unless the terminal
+you're running from has been granted permission. This is the most common failure.
+
+Fix:
+1. Open **System Settings → Privacy & Security → App Management**
+   (if that toggle won't stick, use **Full Disk Access** instead)
+2. Enable the switch for your terminal app (e.g. **Terminal**, **iTerm**, **VS Code**)
+3. **Fully quit** that terminal app (Cmd+Q) and reopen it — required to take effect
+4. Re-run `./ableton-font-replace.sh`
+
+> Note: running the script with `sudo` does **not** help here — the restriction
+> applies to root too. The permission must be granted to the terminal app itself.
 
 ### "Ableton Live is damaged and can't be opened"
 
